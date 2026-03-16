@@ -1,0 +1,48 @@
+services:
+  ideas-store:
+    image: node:22-alpine
+    container_name: ideas-store
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./ideas-store.js:/app/ideas-store.js
+      - ./data:/app/data
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:9321:9321"
+    command: node ideas-store.js
+
+  n8n:
+    image: n8nio/n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    env_file:
+      - .env
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+
+  # --- Voice upgrade (optional) ---
+  # Uncomment the section below to enable voice transcription via Whisper.
+  # Requires ~1.5 GB of free RAM for the 'small' model.
+  # After starting, enable the voice nodes in the n8n workflow and
+  # point them at http://whisper-asr:9000
+  #
+  # whisper-asr:
+  #   image: onerahmet/openai-whisper-asr-webservice:latest
+  #   container_name: whisper-asr
+  #   restart: unless-stopped
+  #   environment:
+  #     - ASR_MODEL=small      # options: tiny, base, small, medium
+  #     - ASR_ENGINE=faster_whisper
+  #   ports:
+  #     - "127.0.0.1:9000:9000"
+
+volumes:
+  n8n_data:

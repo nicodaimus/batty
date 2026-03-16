@@ -1,0 +1,895 @@
+[
+  {
+    "id": null,
+    "name": "Batty - Ideas Capture",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "seconds",
+                "secondsInterval": 30
+              }
+            ]
+          }
+        },
+        "id": "n-001",
+        "name": "Poll Every 30s",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.3,
+        "position": [
+          0,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "method": "GET",
+          "url": "http://ideas-store:9321/offset",
+          "options": {
+            "timeout": 5000
+          }
+        },
+        "id": "n-002",
+        "name": "Load Offset",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          220,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "method": "GET",
+          "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getUpdates",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "offset",
+                "value": "={{ $json.offset }}"
+              },
+              {
+                "name": "timeout",
+                "value": "0"
+              },
+              {
+                "name": "allowed_updates",
+                "value": "[\"message\"]"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 15000
+          }
+        },
+        "id": "n-003",
+        "name": "Get Updates",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          440,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const input = $input.first().json;\nconst updates = input.result || [];\nif (updates.length === 0) return [];\nconst maxId = Math.max(...updates.map(u => u.update_id));\nreturn updates.filter(u => u.message).map(u => ({ json: { message: u.message, new_offset: String(maxId + 1) } }));"
+        },
+        "id": "n-004",
+        "name": "Process Updates",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          660,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "http://ideas-store:9321/offset",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ offset: $json.new_offset }) }}",
+          "options": {
+            "timeout": 5000
+          }
+        },
+        "id": "n-005",
+        "name": "Save Offset",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          880,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const msg = $('Process Updates').item.json.message;\nconst text = (msg.text || '').trim();\nconst chat_id = msg.chat.id;\nconst has_voice = !!msg.voice;\n\nif (has_voice || !text.startsWith('/')) {\n  return [{ json: { is_command: false, message: msg } }];\n}\n\nconst parts = text.split(/\\s+/);\nconst cmd = parts[0].toLowerCase().replace(/@.*/, '');\nconst args = parts.slice(1).join(' ');\n\nlet response = '';\nlet action = null;\n\nif (cmd === '/start' || cmd === '/help') {\n  response = '\\ud83e\\udde0 <b>Ideas Bot</b>\\n\\nSend voice or text to capture ideas.\\n\\n<b>Browse</b>\\n/list - Show active ideas (latest 10)\\n/list all - Show all active ideas\\n/status - Dashboard summary\\n/archive - Archived ideas (latest 10)\\n/archive all - Show all archived ideas\\n\\n<b>Manage</b>\\n/edit 3 title New title - Edit title\\n/edit 3 desc New description - Edit description\\n/priority 3 P1 - Change priority\\n/done 3 - Mark as done\\n/reject 3 - Mark as rejected\\n/delete 3 - Delete idea #3\\n\\n/help - This message';\n} else if (cmd === '/list') {\n  if (args.trim().toLowerCase() === 'all') {\n    action = { type: 'list', all: true };\n  } else {\n    action = { type: 'list', page: parseInt(args) || 1 };\n  }\n} else if (cmd === '/status') {\n  action = { type: 'status' };\n} else if (cmd === '/edit' && args) {\n  const m = args.match(/^(\\d+)\\s+(title|desc|description)\\s+(.+)/is);\n  if (m) {\n    const field = m[2].toLowerCase().startsWith('desc') ? 'description' : 'title';\n    action = { type: 'patch', id: parseInt(m[1]), data: { [field]: m[3].trim() } };\n  } else response = '\\u274c Usage: /edit &lt;id&gt; title|desc &lt;new text&gt;';\n} else if (cmd === '/delete' && args) {\n  const id = parseInt(args);\n  if (id) action = { type: 'delete', id };\n  else response = '\\u274c Usage: /delete <id>';\n} else if (cmd === '/done' && args) {\n  const id = parseInt(args);\n  if (id) action = { type: 'patch', id, data: { status: 'done' } };\n  else response = '\\u274c Usage: /done <id>';\n} else if (cmd === '/reject' && args) {\n  const id = parseInt(args);\n  if (id) action = { type: 'patch', id, data: { status: 'rejected' } };\n  else response = '\\u274c Usage: /reject <id>';\n} else if (cmd === '/priority' && args) {\n  const m = args.match(/(\\d+)\\s+(P[0-3])/i);\n  if (m) {\n    const pMap = { P0: '-critical', P1: '-high', P2: '-medium', P3: '-low' };\n    action = { type: 'patch', id: parseInt(m[1]), data: { priority: m[2].toUpperCase() + (pMap[m[2].toUpperCase()] || '') } };\n  } else response = '\\u274c Usage: /priority &lt;id&gt; &lt;P0|P1|P2|P3&gt;';\n} else if (cmd === '/archive') {\n  if (args.trim().toLowerCase() === 'all') {\n    action = { type: 'archive', all: true };\n  } else {\n    action = { type: 'archive', page: parseInt(args) || 1 };\n  }\n} else {\n  response = '\\u2753 Unknown command. Try /help';\n}\n\nreturn [{ json: { is_command: true, chat_id, response, action } }];"
+        },
+        "id": "n-006",
+        "name": "Parse Command",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1100,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict"
+            },
+            "conditions": [
+              {
+                "id": "is-cmd",
+                "leftValue": "={{ $json.is_command }}",
+                "rightValue": true,
+                "operator": {
+                  "type": "boolean",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "n-007",
+        "name": "Is Command?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          1320,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const input = $json;\nconst action = input.action;\nconst chat_id = input.chat_id;\n\nif (input.response) {\n  return [{ json: { chat_id, text: input.response, needs_api: false } }];\n}\nif (!action) return [];\n\nconst baseUrl = 'http://ideas-store:9321';\nlet url = '', method = 'GET', body = '';\nconst action_type = action.type;\nconst action_data_json = JSON.stringify(action.data || {});\n\nif (action.type === 'list') {\n  url = baseUrl + '/ideas/list' + (action.all ? '?all=true' : '?page=' + action.page);\n} else if (action.type === 'status') {\n  url = baseUrl + '/ideas/status';\n} else if (action.type === 'archive') {\n  url = baseUrl + '/ideas/archive' + (action.all ? '?all=true' : '?page=' + action.page);\n} else if (action.type === 'delete') {\n  url = baseUrl + '/ideas/' + action.id;\n  method = 'DELETE';\n} else if (action.type === 'patch') {\n  url = baseUrl + '/ideas/' + action.id;\n  method = 'PATCH';\n  body = JSON.stringify(action.data);\n}\n\nreturn [{ json: { chat_id, url, method, body, action_type, action_data_json, needs_api: true } }];"
+        },
+        "id": "n-008",
+        "name": "Build Request",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1540,
+          -180
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict"
+            },
+            "conditions": [
+              {
+                "id": "needs-api",
+                "leftValue": "={{ $json.needs_api }}",
+                "rightValue": true,
+                "operator": {
+                  "type": "boolean",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "n-008b",
+        "name": "Needs API?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          1760,
+          -180
+        ]
+      },
+      {
+        "parameters": {
+          "method": "={{ $json.method }}",
+          "url": "={{ $json.url }}",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ $json.body || '{}' }}",
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "id": "n-008c",
+        "name": "Command API",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1980,
+          -300
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const apiRes = $json;\nconst req = $('Build Request').item.json;\nconst chat_id = req.chat_id;\nconst action_type = req.action_type;\nconst action_data = JSON.parse(req.action_data_json || '{}');\n\nif (action_type === 'list' || action_type === 'status' || action_type === 'archive') {\n  return [{ json: { chat_id, text: apiRes.text || 'No data' } }];\n}\nif (action_type === 'delete') {\n  if (apiRes.ok) return [{ json: { chat_id, text: '\\ud83d\\uddd1 Deleted: ' + apiRes.deleted } }];\n  return [{ json: { chat_id, text: '\\u274c ' + (apiRes.error || 'Delete failed') } }];\n}\nif (action_type === 'patch') {\n  if (apiRes.ok) {\n    const idea = apiRes.updated;\n    if (action_data.title || action_data.description) {\n      const field = action_data.title ? 'title' : 'description';\n      let txt = '\\u270f\\ufe0f <b>#' + idea.id + '</b> ' + field + ' updated\\n';\n      txt += '<b>' + idea.title + '</b>';\n      if (action_data.description) txt += '\\n<i>' + idea.description + '</i>';\n      return [{ json: { chat_id, text: txt } }];\n    }\n    let emoji = action_data.status === 'done' ? '\\u2705' : action_data.status === 'rejected' ? '\\u274c' : '\\u2699\\ufe0f';\n    let txt = emoji + ' <b>#' + idea.id + '</b> ' + idea.title;\n    if (action_data.priority) txt += ' \\u2192 ' + idea.priority;\n    if (action_data.status) txt += ' \\u2192 ' + idea.status;\n    return [{ json: { chat_id, text: txt } }];\n  }\n  return [{ json: { chat_id, text: '\\u274c ' + (apiRes.error || 'Update failed') } }];\n}\nreturn [{ json: { chat_id, text: '\\u2753 Unknown action' } }];"
+        },
+        "id": "n-008d",
+        "name": "Format Response",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2200,
+          -300
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.text, parse_mode: 'HTML' }) }}",
+          "options": {}
+        },
+        "id": "n-009",
+        "name": "Command Reply",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2420,
+          -180
+        ]
+      },
+      {
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "message",
+                "name": "message",
+                "value": "={{ $json.message }}",
+                "type": "object"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "n-010",
+        "name": "Restore for Processing",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4,
+        "position": [
+          1540,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict"
+            },
+            "conditions": [
+              {
+                "id": "has-voice",
+                "leftValue": "={{ $json.message.voice }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "object",
+                  "operation": "exists",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "or"
+          },
+          "options": {}
+        },
+        "id": "n-011",
+        "name": "Is Voice?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          1760,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "method": "GET",
+          "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getFile?file_id={{ $json.message.voice.file_id }}",
+          "options": {}
+        },
+        "id": "n-012",
+        "name": "Get File Path",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1980,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://api.telegram.org/file/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ $json.result.file_path }}",
+          "options": {
+            "response": {
+              "response": {
+                "responseFormat": "file"
+              }
+            }
+          }
+        },
+        "id": "n-013",
+        "name": "Download Audio",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2200,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "http://whisper-asr:9000/asr",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "output",
+                "value": "json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "contentType": "multipart-form-data",
+          "bodyParameters": {
+            "parameters": [
+              {
+                "parameterType": "formBinaryData",
+                "name": "audio_file",
+                "inputDataFieldName": "data"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 120000
+          }
+        },
+        "id": "n-014",
+        "name": "Whisper STT",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2420,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "raw-text",
+                "name": "raw_text",
+                "value": "={{ typeof $json.data === 'string' ? JSON.parse($json.data).text : ($json.text || '') }}",
+                "type": "string"
+              },
+              {
+                "id": "source-type",
+                "name": "source_type",
+                "value": "voice",
+                "type": "string"
+              },
+              {
+                "id": "language",
+                "name": "language",
+                "value": "={{ typeof $json.data === 'string' ? JSON.parse($json.data).language : ($json.language || 'auto') }}",
+                "type": "string"
+              },
+              {
+                "id": "chat-id",
+                "name": "chat_id",
+                "value": "={{ $('Restore for Processing').item.json.message.chat.id }}",
+                "type": "number"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "n-015",
+        "name": "Set Voice Text",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4,
+        "position": [
+          2640,
+          0
+        ]
+      },
+      {
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "raw-text",
+                "name": "raw_text",
+                "value": "={{ $json.message.text }}",
+                "type": "string"
+              },
+              {
+                "id": "source-type",
+                "name": "source_type",
+                "value": "text",
+                "type": "string"
+              },
+              {
+                "id": "language",
+                "name": "language",
+                "value": "auto",
+                "type": "string"
+              },
+              {
+                "id": "chat-id",
+                "name": "chat_id",
+                "value": "={{ $json.message.chat.id }}",
+                "type": "number"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "n-016",
+        "name": "Set Text Input",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4,
+        "position": [
+          1980,
+          240
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://chat.nicodaimus.com/v1/chat/completions",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "content-type",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "=Bearer {{ $env.NICODAIMUS_API_KEY }}"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ model: 'auto', max_tokens: 1024, messages: [{ role: 'user', content: 'You are an idea structuring assistant for ' + ($env.PROJECT_NAME || 'my project') + '. Your job is to extract and structure idea(s) from raw voice transcriptions or text input.\\n\\nRules:\\n1. The input may contain multiple ideas in a single message - split them into separate items\\n2. Clean up speech artifacts (um, uh, so, like) but preserve the meaning\\n3. If the input is conversational/greeting (hi, hello, thanks) and contains NO actionable idea, return: [{\"title\": \"No idea detected\", \"description\": \"Conversational message, no actionable idea.\", \"category\": \"none\", \"priority\": \"none\", \"raw_input\": \"<the input>\"}]\\n\\nFor EACH idea, output a JSON array with objects containing:\\n- title: clear, specific title (5-10 words, describe WHAT should be done)\\n- description: 1-2 sentence summary explaining the idea and its value\\n- category: one of [feature, security, infrastructure, content, business, ux, integration, research]\\n- priority: one of [P0-critical, P1-high, P2-medium, P3-low] based on impact and urgency\\n- raw_input: the relevant portion of the original text for this idea\\n\\nRespond with ONLY a valid JSON array. No markdown backticks, no explanation, no text before or after the JSON.\\n\\nRaw input:\\n' + $json.raw_text }] }) }}",
+          "options": {
+            "timeout": 30000
+          }
+        },
+        "id": "n-017",
+        "name": "Claude Structure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2860,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const input = $input.first().json;\n\nlet ideas;\ntry {\n  let text = input.choices[0].message.content.trim();\n  if (text.startsWith('```')) text = text.replace(/^```(?:json)?\\n?/, '').replace(/\\n?```$/, '');\n  ideas = JSON.parse(text);\n} catch (e) {\n  try {\n    const match = input.choices[0].message.content.match(/\\[.*\\]/s);\n    if (match) ideas = JSON.parse(match[0]);\n    else throw new Error('no json');\n  } catch(e2) {\n    ideas = [{ title: 'Raw capture (auto-parse failed)', description: 'Could not structure automatically.', category: 'feature', priority: 'P2-medium', raw_input: 'parse_error' }];\n  }\n}\n\n// Resolve chat_id FIRST (before any early returns)\nlet source_type = 'text', language = 'auto', chat_id = 0;\ntry { source_type = $('Set Text Input').first().json.source_type; language = $('Set Text Input').first().json.language; chat_id = $('Set Text Input').first().json.chat_id; } catch(e) {}\ntry { if (!chat_id) { source_type = $('Set Voice Text').first().json.source_type; language = $('Set Voice Text').first().json.language; chat_id = $('Set Voice Text').first().json.chat_id; } } catch(e) {}\n\nconst noIdea = ideas.find(i => i.category === 'none');\nideas = ideas.filter(i => i.category !== 'none');\nif (ideas.length === 0) return [{ json: { skip: true, chat_id, reason: noIdea ? noIdea.description : 'No actionable idea detected.' } }];\n\nconst now = new Date().toISOString();\nreturn ideas.map(idea => ({ json: { ...idea, source_type, language, timestamp: now, status: 'new', chat_id } }));"
+        },
+        "id": "n-018",
+        "name": "Structure Ideas",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          3080,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict"
+            },
+            "conditions": [
+              {
+                "id": "not-skip",
+                "leftValue": "={{ $json.skip }}",
+                "rightValue": true,
+                "operator": {
+                  "type": "boolean",
+                  "operation": "notEquals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "n-019",
+        "name": "Has Ideas?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          3300,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "http://ideas-store:9321/ideas",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($input.all().map(i => i.json)) }}",
+          "options": {
+            "timeout": 5000
+          }
+        },
+        "id": "n-020",
+        "name": "Save Ideas",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3520,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, parse_mode: 'HTML', text: $json.titles.map(t => '\\u2705 ' + t).join('\\n\\n') }) }}",
+          "options": {}
+        },
+        "id": "n-021",
+        "name": "Telegram Reply",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3740,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, parse_mode: 'HTML', text: '💬 Got your message - no idea captured.\\n\\n<i>' + ($json.reason || 'No actionable idea detected.') + '</i>\\n\\nSend a voice or text message with an idea to capture it, or use /help for commands.' }) }}",
+          "options": {}
+        },
+        "name": "No Idea Reply",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3520,
+          240
+        ],
+        "id": "no-idea-reply-001"
+      }
+    ],
+    "connections": {
+      "Poll Every 30s": {
+        "main": [
+          [
+            {
+              "node": "Load Offset",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Load Offset": {
+        "main": [
+          [
+            {
+              "node": "Get Updates",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Get Updates": {
+        "main": [
+          [
+            {
+              "node": "Process Updates",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Process Updates": {
+        "main": [
+          [
+            {
+              "node": "Save Offset",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Save Offset": {
+        "main": [
+          [
+            {
+              "node": "Parse Command",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Command": {
+        "main": [
+          [
+            {
+              "node": "Is Command?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Command?": {
+        "main": [
+          [
+            {
+              "node": "Build Request",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Restore for Processing",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Request": {
+        "main": [
+          [
+            {
+              "node": "Needs API?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Needs API?": {
+        "main": [
+          [
+            {
+              "node": "Command API",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Command Reply",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Command API": {
+        "main": [
+          [
+            {
+              "node": "Format Response",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Format Response": {
+        "main": [
+          [
+            {
+              "node": "Command Reply",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Restore for Processing": {
+        "main": [
+          [
+            {
+              "node": "Is Voice?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Voice?": {
+        "main": [
+          [
+            {
+              "node": "Get File Path",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Set Text Input",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Get File Path": {
+        "main": [
+          [
+            {
+              "node": "Download Audio",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Download Audio": {
+        "main": [
+          [
+            {
+              "node": "Whisper STT",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Whisper STT": {
+        "main": [
+          [
+            {
+              "node": "Set Voice Text",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Set Voice Text": {
+        "main": [
+          [
+            {
+              "node": "Claude Structure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Set Text Input": {
+        "main": [
+          [
+            {
+              "node": "Claude Structure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Claude Structure": {
+        "main": [
+          [
+            {
+              "node": "Structure Ideas",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structure Ideas": {
+        "main": [
+          [
+            {
+              "node": "Has Ideas?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Has Ideas?": {
+        "main": [
+          [
+            {
+              "node": "Save Ideas",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "No Idea Reply",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Save Ideas": {
+        "main": [
+          [
+            {
+              "node": "Telegram Reply",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1"
+    },
+    "staticData": {
+      "node:Poll Every 10s": {
+        "recurrenceRules": []
+      },
+      "node:Poll Every 30s": {
+        "recurrenceRules": []
+      }
+    },
+    "meta": null,
+    "pinData": {},
+    "versionId": "306cdec1-9419-49ac-8f9d-a7eee59e1027",
+    "activeVersionId": "306cdec1-9419-49ac-8f9d-a7eee59e1027",
+    "versionCounter": 69,
+    "triggerCount": 1,
+    "tags": [],
+    "shared": [],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]
