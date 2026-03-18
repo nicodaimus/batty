@@ -12,6 +12,7 @@
 //   NICODAIMUS_API_URL   - default: https://chat.nicodaimus.com/v1
 //   PROJECT_NAME         - default: My Ideas Pipeline
 //   TODO_FILE            - path to your TODO markdown file (optional)
+//   STATUS_FILE          - path to your STATUS markdown file (optional, for shipped-feature dedup)
 //   REPORTS_DIR          - where to save review reports (default: ./reports)
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
@@ -24,6 +25,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PROJECT_NAME = process.env.PROJECT_NAME || 'My Ideas Pipeline';
 const TODO_FILE = process.env.TODO_FILE ? resolve(process.env.TODO_FILE) : null;
+const STATUS_FILE = process.env.STATUS_FILE ? resolve(process.env.STATUS_FILE) : null;
 const REPORTS_DIR = process.env.REPORTS_DIR ? resolve(process.env.REPORTS_DIR) : resolve('./reports');
 const MODE = process.argv.includes('--weekly') ? 'weekly' : 'daily';
 
@@ -71,6 +73,13 @@ function readTodo() {
   return out.join('\n') || '(empty TODO file)';
 }
 
+function readStatus() {
+  if (!STATUS_FILE || !existsSync(STATUS_FILE)) return '';
+  // Extract only section/task headings - STATUS files can be very large
+  const lines = readFileSync(STATUS_FILE, 'utf8').split('\n');
+  return lines.filter(l => l.startsWith('## ') || l.startsWith('### ')).join('\n');
+}
+
 async function callNicodaimus(prompt) {
   const res = await fetch(`${NICODAIMUS_API_URL}/chat/completions`, {
     method: 'POST',
@@ -80,7 +89,7 @@ async function callNicodaimus(prompt) {
     },
     body: JSON.stringify({
       model: 'auto',
-      max_tokens: 4096,
+      max_tokens: 8192,
       messages: [{ role: 'user', content: prompt }],
     }),
   });
@@ -91,6 +100,9 @@ async function callNicodaimus(prompt) {
   const data = await res.json();
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error('nicodAImus API returned empty choices');
+  if (content.length < 200 && /failed|error|unavailable/i.test(content)) {
+    throw new Error(`nicodAImus API returned error content: ${content}`);
+  }
   return content;
 }
 
@@ -155,6 +167,20 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function parseJsonResponse(text) {
+  let jsonText = text.trim();
+  // Extract JSON from markdown fences (greedy match for nested fences)
+  const fenceMatch = jsonText.match(/```(?:json)?\s*\n?([\s\S]*)\n?\s*```\s*$/);
+  if (fenceMatch) jsonText = fenceMatch[1].trim();
+  // Fallback: find first { to last }
+  if (!jsonText.startsWith('{')) {
+    const start = jsonText.indexOf('{');
+    const end = jsonText.lastIndexOf('}');
+    if (start !== -1 && end !== -1) jsonText = jsonText.slice(start, end + 1);
+  }
+  return JSON.parse(jsonText);
+}
+
 // ---- DAILY REVIEW ----
 
 async function dailyReview() {
@@ -171,24 +197,17 @@ async function dailyReview() {
 
   log(`Found ${newIdeas.length} new idea(s) to review.`);
   const todoMd = readTodo();
-  const prompt = buildDailyPrompt(newIdeas, ideas, todoMd);
+  const statusMd = readStatus();
+  const prompt = buildDailyPrompt(newIdeas, ideas, todoMd, statusMd);
   const analysis = await callNicodaimus(prompt);
 
   let result;
   try {
-    let jsonText = analysis.trim();
-    const fenceMatch = jsonText.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-    if (fenceMatch) jsonText = fenceMatch[1].trim();
-    if (!jsonText.startsWith('{')) {
-      const start = jsonText.indexOf('{');
-      const end = jsonText.lastIndexOf('}');
-      if (start !== -1 && end !== -1) jsonText = jsonText.slice(start, end + 1);
-    }
-    result = JSON.parse(jsonText);
+    result = parseJsonResponse(analysis);
   } catch (e) {
     log('Warning: Could not parse response as JSON. Sending raw analysis.');
-    saveReport(`review-${today()}.md`, `# Daily Ideas Review - ${today()}\n\n${analysis}`);
-    await sendTelegram(`\u2615 <b>Daily Ideas Review</b> (${today()})\n\n${newIdeas.length} idea(s) reviewed.\n\nNote: Auto-parse failed, see reports folder.`);
+    const reportPath = saveReport(`review-${today()}.md`, `# Daily Ideas Review - ${today()}\n\n${analysis}`);
+    await sendTelegram(`\u2615 <b>Daily Ideas Review</b> (${today()})\n\n${newIdeas.length} idea(s) reviewed.\n\nNote: Auto-parse failed.\n<code>${reportPath}</code>`);
     return;
   }
 
@@ -207,37 +226,46 @@ async function dailyReview() {
   log('Daily review complete.');
 }
 
-function buildDailyPrompt(newIdeas, allIdeas, todoMd) {
+function buildDailyPrompt(newIdeas, allIdeas, todoMd, statusMd) {
   const ideasJson = JSON.stringify(newIdeas, null, 2);
 
-  return `You are the daily review analyst for "${PROJECT_NAME}".
-Your job is to analyze new ideas, score them by ROI, check for duplicates against the existing backlog, and make recommendations.
+  let prompt = `You are the daily review analyst for "${PROJECT_NAME}".
+Your job is to analyze new ideas, score them by ROI, check for duplicates against the existing backlog${statusMd ? ' AND already-shipped features' : ''}, and make recommendations.
 
 ## ROI Scoring (1-5 scale for each, then weighted composite out of 10)
-- Security Impact (weight: ${WEIGHTS.security}): Does this improve security or protect users?
-- Customer Value (weight: ${WEIGHTS.customer}): Does this directly benefit users or solve pain points?
+- Security Impact (weight: ${WEIGHTS.security}): Does this improve security posture, protect users, or address vulnerabilities?
+- Customer Value (weight: ${WEIGHTS.customer}): Does this directly benefit users? Improve UX? Solve pain points?
 - Implementation Effort (weight: ${WEIGHTS.effort}): How easy to implement? 5=trivial (hours), 4=small (1 day), 3=medium (2-3 days), 2=large (1 week), 1=massive (weeks+)
-- Business Impact (weight: ${WEIGHTS.business}): Revenue potential, differentiation, competitive advantage?
+- Business Impact (weight: ${WEIGHTS.business}): Revenue potential, differentiation, growth, competitive advantage?
 
 Composite = (security*${WEIGHTS.security} + customer*${WEIGHTS.customer} + effort*${WEIGHTS.effort} + business*${WEIGHTS.business}) * 2
 
 ## New Ideas to Review
 ${ideasJson}
 
-## Current Backlog (TODO.md) - Check for duplicates
-${todoMd}
+## Current Backlog (TODO) - Check for duplicates against planned work
+${todoMd}`;
+
+  if (statusMd) {
+    prompt += `
+
+## Current Feature Inventory (STATUS) - Check for duplicates against shipped features
+${statusMd}`;
+  }
+
+  prompt += `
 
 ## Instructions
 For each new idea, provide:
 - ROI scores (security, customer, effort, business) and composite
-- Whether it duplicates an existing TODO item (cite which one)
-- Brief research notes: best practices, implications
-- Recommendation: "add_to_todo", "defer", "reject", or "needs_research"
-- If "add_to_todo": suggest priority (P0-P3)
+- Whether it duplicates an existing backlog item or shipped feature (cite which one)
+- Brief research notes: best practices, competitor approaches, security implications
+- Recommendation: "add_to_todo" (should be added to backlog), "defer" (interesting but not now), "reject" (not valuable), "needs_research" (promising but needs deeper investigation)
+- If "add_to_todo": suggest which backlog section and priority (P0-P3)
 
 CRITICAL JSON RULES:
 - Respond with ONLY the raw JSON object. No markdown fences, no text before or after.
-- All string values must be single-line. Escape newlines as \\n.
+- All string values must be single-line. Escape newlines as \\n, not literal line breaks.
 
 {
   "ideas": [
@@ -247,14 +275,19 @@ CRITICAL JSON RULES:
       "scores": { "security": <1-5>, "customer": <1-5>, "effort": <1-5>, "business": <1-5> },
       "roi_composite": <number 0-10>,
       "is_duplicate": <boolean>,
-      "duplicate_of": "<string or null>",
-      "research_notes": "<single-line string>",
+      "duplicate_of": "<backlog/status item name or null>",
+      "research_notes": "<single-line string, no literal newlines>",
       "recommendation": "add_to_todo|defer|reject|needs_research",
       "suggested_priority": "P0|P1|P2|P3",
+      "suggested_section": "<backlog section name>",
       "rationale": "<1-2 sentences, single-line>"
     }
-  ]
+  ],
+  "ranked_summary": "<optional: ranked list of ideas by ROI>",
+  "top_recommendation": "<optional: 1-2 sentence focus recommendation>"
 }`;
+
+  return prompt;
 }
 
 function buildDailyReport(result, newIdeas) {
@@ -263,7 +296,13 @@ function buildDailyReport(result, newIdeas) {
   md += `**Ideas reviewed:** ${(result.ideas || []).length}\n\n`;
 
   for (const idea of result.ideas || []) {
-    const rec = { add_to_todo: 'ADD TO BACKLOG', defer: 'DEFER', reject: 'REJECT', needs_research: 'NEEDS RESEARCH' }[idea.recommendation] || idea.recommendation;
+    const rec = {
+      add_to_todo: 'ADD TO BACKLOG',
+      defer: 'DEFER',
+      reject: 'REJECT',
+      needs_research: 'NEEDS RESEARCH',
+    }[idea.recommendation] || idea.recommendation;
+
     md += `## #${idea.id} - ${idea.title}\n\n`;
     md += `| Metric | Score |\n|--------|-------|\n`;
     md += `| Security | ${idea.scores?.security || '?'}/5 |\n`;
@@ -273,22 +312,38 @@ function buildDailyReport(result, newIdeas) {
     md += `| **ROI Composite** | **${idea.roi_composite || '?'}/10** |\n\n`;
     md += `**Recommendation:** ${rec}`;
     if (idea.suggested_priority) md += ` (${idea.suggested_priority})`;
+    if (idea.suggested_section) md += ` - Section: ${idea.suggested_section}`;
     md += `\n\n`;
     if (idea.is_duplicate) md += `**Duplicate of:** ${idea.duplicate_of}\n\n`;
     if (idea.research_notes) md += `**Research:** ${idea.research_notes}\n\n`;
     if (idea.rationale) md += `**Rationale:** ${idea.rationale}\n\n`;
     md += `---\n\n`;
   }
+
+  if (result.ranked_summary) {
+    md += `## Ranked Summary\n\n${result.ranked_summary}\n\n`;
+  }
+  if (result.top_recommendation) {
+    md += `## Top Recommendation\n\n${result.top_recommendation}\n\n`;
+  }
+
   return md;
 }
 
 function buildDailyTelegram(result) {
   let msg = `\u2615 <b>Daily Ideas Review</b> (${today()})\n\n`;
   for (const idea of result.ideas || []) {
-    const emoji = { add_to_todo: '\u2705', defer: '\u23f8\ufe0f', reject: '\u274c', needs_research: '\ud83d\udd0d' }[idea.recommendation] || '\u2753';
+    const emoji = {
+      add_to_todo: '\u2705',
+      defer: '\u23f8\ufe0f',
+      reject: '\u274c',
+      needs_research: '\ud83d\udd0d',
+    }[idea.recommendation] || '\u2753';
     msg += `${emoji} #${idea.id} <b>${idea.title}</b> [${idea.roi_composite}/10]\n`;
   }
-  if (result.top_recommendation) msg += `\n\ud83c\udfaf <b>Focus:</b> ${result.top_recommendation}`;
+  if (result.top_recommendation) {
+    msg += `\n\ud83c\udfaf <b>Focus:</b> ${result.top_recommendation}`;
+  }
   return msg;
 }
 
@@ -299,85 +354,139 @@ async function weeklyReport() {
 
   const ideas = await fetchIdeas();
   const todoMd = readTodo();
-  const prompt = buildWeeklyPrompt(ideas, todoMd);
+  const statusMd = readStatus();
+  const prompt = buildWeeklyPrompt(ideas, todoMd, statusMd);
   const analysis = await callNicodaimus(prompt);
 
   let result;
   try {
-    let jsonText = analysis.trim();
-    const fenceMatch = jsonText.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-    if (fenceMatch) jsonText = fenceMatch[1].trim();
-    if (!jsonText.startsWith('{')) {
-      const start = jsonText.indexOf('{');
-      const end = jsonText.lastIndexOf('}');
-      if (start !== -1 && end !== -1) jsonText = jsonText.slice(start, end + 1);
-    }
-    result = JSON.parse(jsonText);
+    result = parseJsonResponse(analysis);
   } catch (e) {
     log('Warning: Could not parse weekly response as JSON.');
-    saveReport(`weekly-${today()}.md`, `# Weekly Report - ${today()}\n\n${analysis}`);
-    await sendTelegram(`\ud83d\udcca <b>Weekly Report</b> (${today()})\n\nSee reports folder.`);
+    const reportPath = saveReport(`weekly-${today()}.md`, `# Weekly Report - ${today()}\n\n${analysis}`);
+    await sendTelegram(`\ud83d\udcca <b>Weekly Report</b> (${today()})\n\nSee full report:\n<code>${reportPath}</code>`);
     return;
   }
 
-  saveReport(`weekly-${today()}.md`, buildWeeklyReport(result));
-  await sendTelegram(buildWeeklyTelegram(result));
+  const report = buildWeeklyReport(result);
+  saveReport(`weekly-${today()}.md`, report);
+
+  const telegram = buildWeeklyTelegram(result);
+  await sendTelegram(telegram);
+
   log('Weekly report complete.');
 }
 
-function buildWeeklyPrompt(ideas, todoMd) {
-  return `You are the weekly review analyst for "${PROJECT_NAME}".
-Produce a Sunday evening progress report: what ideas exist, their status, priorities, and what should come next.
+function buildWeeklyPrompt(ideas, todoMd, statusMd) {
+  let prompt = `You are the weekly review analyst for "${PROJECT_NAME}".
+Your job is to produce a Sunday evening progress report: what happened this week, what's been implemented, parked, or deferred, and what should come next.
 
 ## All Ideas in Pipeline
 ${JSON.stringify(ideas, null, 2)}
 
-## Current Backlog (TODO.md)
-${todoMd}
+## Current Backlog (TODO)
+${todoMd}`;
+
+  if (statusMd) {
+    prompt += `
+
+## Current Feature Inventory (STATUS) - What's already shipped
+${statusMd}`;
+  }
+
+  prompt += `
 
 ## ROI Scoring Weights
 Security: ${WEIGHTS.security}, Customer: ${WEIGHTS.customer}, Effort: ${WEIGHTS.effort}, Business: ${WEIGHTS.business}
 
 ## Instructions
-1. Categorize all ideas by status (new, reviewed, done, rejected, deferred)
-2. Re-evaluate priorities - should anything shift?
-3. Identify top 3 items to focus on next week, ranked by ROI
-4. Flag ideas sitting too long without action (>7 days as "new")
-5. Provide a pipeline health score (1-10)
+1. Categorize all ideas by current status (new, reviewed, done, rejected, deferred)
+2. For ideas still "new" or "reviewed": re-evaluate priorities. Has anything changed? Should priorities shift?
+3. Check for duplicates across ideas AND between ideas and the backlog
+4. Identify the top 3-5 items to focus on next week (from both ideas and backlog), ranked by ROI
+5. Flag any ideas that have been sitting too long without action (>7 days in "new")
+6. Provide a weekly health score (1-10): is the idea pipeline flowing well? Are items getting actioned?
 
 Respond with ONLY valid JSON:
 {
-  "status_summary": { "total": <n>, "new": <n>, "reviewed": <n>, "done": <n>, "rejected": <n>, "deferred": <n> },
+  "status_summary": {
+    "total": <number>,
+    "new": <number>,
+    "reviewed": <number>,
+    "done": <number>,
+    "rejected": <number>,
+    "deferred": <number>
+  },
   "completed_this_week": ["<title>", ...],
-  "stale_ideas": [{ "id": <n>, "title": "<s>", "days_old": <n> }],
-  "next_week_focus": [{ "title": "<s>", "roi_score": <n>, "rationale": "<s>" }],
+  "priority_changes": [
+    { "id": <number>, "title": "<string>", "old_priority": "<string>", "new_priority": "<string>", "reason": "<string>" }
+  ],
+  "duplicates_found": [
+    { "idea_id": <number>, "duplicate_of": "<string>" }
+  ],
+  "stale_ideas": [
+    { "id": <number>, "title": "<string>", "days_old": <number> }
+  ],
+  "next_week_focus": [
+    { "title": "<string>", "source": "idea|todo", "roi_score": <number>, "rationale": "<string>" }
+  ],
   "pipeline_health": <1-10>,
-  "pipeline_health_notes": "<s>"
+  "pipeline_health_notes": "<string>"
 }`;
+
+  return prompt;
 }
 
 function buildWeeklyReport(result) {
   let md = `# Weekly Progress Report - ${today()}\n\n**Project:** ${PROJECT_NAME}\n\n`;
+
   const s = result.status_summary || {};
-  md += `## Pipeline Status\n| Status | Count |\n|--------|-------|\n`;
+  md += `## Pipeline Status\n`;
+  md += `| Status | Count |\n|--------|-------|\n`;
   for (const [k, v] of Object.entries(s)) md += `| ${k} | ${v} |\n`;
   md += `\n**Pipeline Health:** ${result.pipeline_health || '?'}/10\n`;
   if (result.pipeline_health_notes) md += `${result.pipeline_health_notes}\n`;
+  md += `\n`;
+
   if (result.completed_this_week?.length) {
-    md += `\n## Completed This Week\n`;
+    md += `## Completed This Week\n`;
     for (const item of result.completed_this_week) md += `- ${item}\n`;
+    md += `\n`;
   }
-  if (result.next_week_focus?.length) {
-    md += `\n## Next Week Focus\n`;
-    for (let i = 0; i < result.next_week_focus.length; i++) {
-      const f = result.next_week_focus[i];
-      md += `### ${i + 1}. ${f.title} (ROI: ${f.roi_score}/10)\n${f.rationale}\n\n`;
+
+  if (result.priority_changes?.length) {
+    md += `## Priority Changes\n`;
+    for (const pc of result.priority_changes) {
+      md += `- #${pc.id} ${pc.title}: ${pc.old_priority} -> ${pc.new_priority} (${pc.reason})\n`;
     }
+    md += `\n`;
   }
+
+  if (result.duplicates_found?.length) {
+    md += `## Duplicates Found\n`;
+    for (const d of result.duplicates_found) {
+      md += `- Idea #${d.idea_id} duplicates: ${d.duplicate_of}\n`;
+    }
+    md += `\n`;
+  }
+
   if (result.stale_ideas?.length) {
     md += `## Stale Ideas (>7 days)\n`;
-    for (const si of result.stale_ideas) md += `- #${si.id} ${si.title} (${si.days_old} days)\n`;
+    for (const si of result.stale_ideas) {
+      md += `- #${si.id} ${si.title} (${si.days_old} days old)\n`;
+    }
+    md += `\n`;
   }
+
+  if (result.next_week_focus?.length) {
+    md += `## Next Week Focus\n`;
+    for (let i = 0; i < result.next_week_focus.length; i++) {
+      const f = result.next_week_focus[i];
+      md += `### ${i + 1}. ${f.title} (ROI: ${f.roi_score}/10)\n`;
+      md += `Source: ${f.source || 'unknown'} | ${f.rationale}\n\n`;
+    }
+  }
+
   return md;
 }
 
@@ -385,24 +494,48 @@ function buildWeeklyTelegram(result) {
   const s = result.status_summary || {};
   let msg = `\ud83d\udcca <b>Weekly Report</b> (${today()})\n`;
   msg += `Health: ${result.pipeline_health || '?'}/10 | ${s.total || '?'} ideas\n\n`;
+
   if (result.completed_this_week?.length) {
     msg += `\u2705 <b>Shipped:</b>\n`;
-    for (const item of result.completed_this_week.slice(0, 5)) msg += `  ${item}\n`;
+    for (const item of result.completed_this_week.slice(0, 5)) {
+      msg += `  ${item}\n`;
+    }
+    if (result.completed_this_week.length > 5) {
+      msg += `  +${result.completed_this_week.length - 5} more\n`;
+    }
     msg += `\n`;
   }
+
   if (result.next_week_focus?.length) {
     msg += `\ud83c\udfaf <b>Next week:</b>\n`;
     for (let i = 0; i < Math.min(result.next_week_focus.length, 3); i++) {
       const f = result.next_week_focus[i];
       msg += `  ${i + 1}. <b>${f.title}</b> [${f.roi_score}/10]\n`;
+      if (f.rationale) {
+        const first = f.rationale.split('. ')[0];
+        const short = first.endsWith('.') ? first : first + '.';
+        msg += `     <i>${short}</i>\n`;
+      }
     }
     msg += `\n`;
   }
-  if (result.stale_ideas?.length) msg += `\u26a0\ufe0f <b>${result.stale_ideas.length} stale idea(s)</b>\n\n`;
+
+  if (result.stale_ideas?.length) {
+    msg += `\u26a0\ufe0f <b>${result.stale_ideas.length} stale:</b> `;
+    msg += result.stale_ideas.map(si => `#${si.id}`).join(', ');
+    msg += `\n\n`;
+  }
+
+  if (result.duplicates_found?.length) {
+    msg += `\ud83d\udd04 <b>${result.duplicates_found.length} duplicate(s)</b> found\n\n`;
+  }
+
   if (result.pipeline_health_notes) {
     const first = result.pipeline_health_notes.split('. ')[0];
-    msg += `<i>${first.endsWith('.') ? first : first + '.'}</i>`;
+    const note = first.endsWith('.') ? first : first + '.';
+    msg += `<i>${note}</i>`;
   }
+
   return msg;
 }
 

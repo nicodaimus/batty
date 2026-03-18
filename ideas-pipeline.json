@@ -486,7 +486,7 @@
           }
         },
         "id": "n-017",
-        "name": "Claude Structure",
+        "name": "AI Structure",
         "type": "n8n-nodes-base.httpRequest",
         "typeVersion": 4.2,
         "position": [
@@ -798,7 +798,7 @@
         "main": [
           [
             {
-              "node": "Claude Structure",
+              "node": "AI Structure",
               "type": "main",
               "index": 0
             }
@@ -809,14 +809,14 @@
         "main": [
           [
             {
-              "node": "Claude Structure",
+              "node": "AI Structure",
               "type": "main",
               "index": 0
             }
           ]
         ]
       },
-      "Claude Structure": {
+      "AI Structure": {
         "main": [
           [
             {
