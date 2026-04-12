@@ -10,10 +10,15 @@
 // Optional env vars:
 //   IDEAS_STORE_URL      - default: http://ideas-store:9321
 //   NICODAIMUS_API_URL   - default: https://chat.nicodaimus.com/v1
-//   PROJECT_NAME         - default: My Ideas Pipeline
-//   TODO_FILE            - path to your TODO markdown file (optional)
-//   STATUS_FILE          - path to your STATUS markdown file (optional, for shipped-feature dedup)
+//   PROJECT_NAME         - default: My Ideas Pipeline (single-project mode only)
+//   TODO_FILE            - path to your TODO markdown file (single-project mode)
+//   STATUS_FILE          - path to your STATUS markdown file (single-project mode)
 //   REPORTS_DIR          - where to save review reports (default: ./reports)
+//
+// Multi-project mode (optional):
+//   PROJECTS             - CSV of project names, e.g. "web,mobile,ops". Enables per-project routing.
+//   PROJECT_<NAME>_TODO  - per-project TODO file, e.g. PROJECT_web_TODO=./web/TODO.md
+//   PROJECT_<NAME>_STATUS - per-project STATUS file (optional)
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, resolve } from 'path';
@@ -28,6 +33,20 @@ const TODO_FILE = process.env.TODO_FILE ? resolve(process.env.TODO_FILE) : null;
 const STATUS_FILE = process.env.STATUS_FILE ? resolve(process.env.STATUS_FILE) : null;
 const REPORTS_DIR = process.env.REPORTS_DIR ? resolve(process.env.REPORTS_DIR) : resolve('./reports');
 const MODE = process.argv.includes('--weekly') ? 'weekly' : 'daily';
+
+// Multi-project config
+const PROJECTS = (process.env.PROJECTS || '').split(',').map(s => s.trim()).filter(Boolean);
+const MULTI_PROJECT = PROJECTS.length > 0;
+const DEFAULT_PROJECT = PROJECTS[0] || null;
+function projectOf(idea) {
+  if (!MULTI_PROJECT) return null;
+  return PROJECTS.includes(idea.project) ? idea.project : DEFAULT_PROJECT;
+}
+function perProjectPath(project, kind) {
+  // kind = 'TODO' or 'STATUS'. Env var name: PROJECT_<project>_<kind>
+  const envKey = 'PROJECT_' + project + '_' + kind;
+  return process.env[envKey] ? resolve(process.env[envKey]) : null;
+}
 
 // ROI scoring weights
 const WEIGHTS = {
@@ -56,10 +75,10 @@ async function updateIdeaStatus(id, status) {
   if (!res.ok) log(`Warning: failed to update idea #${id} status: ${res.status}`);
 }
 
-function readTodo() {
-  if (!TODO_FILE || !existsSync(TODO_FILE)) return '(no TODO file configured)';
-  // Extract only section headers + task headings + priority to stay within context window
-  const lines = readFileSync(TODO_FILE, 'utf8').split('\n');
+function extractTodoSummary(text) {
+  // Pull section headers + any table rows that are not marked done, to stay within context window.
+  // Works for both Markdown heading-style TODOs and table-style TODOs.
+  const lines = text.split('\n');
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -68,16 +87,45 @@ function readTodo() {
       for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
         if (/^\*\*(Priority|Area|Status):\*\*/.test(lines[j])) out.push(lines[j]);
       }
+    } else if (/^\|\s*[\w-]+/.test(line) && !/\|\s*done\s*\|/i.test(line)) {
+      // Table row, not done. Keep first 5 columns only.
+      out.push(line.split('|').slice(0, 5).join('|'));
     }
   }
   return out.join('\n') || '(empty TODO file)';
 }
 
-function readStatus() {
-  if (!STATUS_FILE || !existsSync(STATUS_FILE)) return '';
-  // Extract only section/task headings - STATUS files can be very large
-  const lines = readFileSync(STATUS_FILE, 'utf8').split('\n');
+function readTodo(filePath) {
+  const f = filePath || TODO_FILE;
+  if (!f || !existsSync(f)) return '(no TODO file configured)';
+  return extractTodoSummary(readFileSync(f, 'utf8'));
+}
+
+function readStatus(filePath) {
+  const f = filePath || STATUS_FILE;
+  if (!f || !existsSync(f)) return '';
+  const lines = readFileSync(f, 'utf8').split('\n');
   return lines.filter(l => l.startsWith('## ') || l.startsWith('### ')).join('\n');
+}
+
+// Returns { [projectName]: todoMdString } for multi-project mode, or {} otherwise.
+function readProjectTodos() {
+  if (!MULTI_PROJECT) return {};
+  const out = {};
+  for (const p of PROJECTS) {
+    const path = perProjectPath(p, 'TODO');
+    out[p] = path ? readTodo(path) : '(no TODO file configured for ' + p + ')';
+  }
+  return out;
+}
+function readProjectStatuses() {
+  if (!MULTI_PROJECT) return {};
+  const out = {};
+  for (const p of PROJECTS) {
+    const path = perProjectPath(p, 'STATUS');
+    out[p] = path ? readStatus(path) : '';
+  }
+  return out;
 }
 
 async function callNicodaimus(prompt) {
@@ -196,9 +244,16 @@ async function dailyReview() {
   }
 
   log(`Found ${newIdeas.length} new idea(s) to review.`);
-  const todoMd = readTodo();
-  const statusMd = readStatus();
-  const prompt = buildDailyPrompt(newIdeas, ideas, todoMd, statusMd);
+  if (MULTI_PROJECT) {
+    const counts = {};
+    for (const i of newIdeas) counts[projectOf(i)] = (counts[projectOf(i)] || 0) + 1;
+    log('Project breakdown: ' + Object.entries(counts).map(([k,v]) => `${k}=${v}`).join(', '));
+  }
+  const todoMd = MULTI_PROJECT ? null : readTodo();
+  const statusMd = MULTI_PROJECT ? null : readStatus();
+  const projectTodos = readProjectTodos();
+  const projectStatuses = readProjectStatuses();
+  const prompt = buildDailyPrompt(newIdeas, ideas, { todoMd, statusMd, projectTodos, projectStatuses });
   const analysis = await callNicodaimus(prompt);
 
   let result;
@@ -226,10 +281,38 @@ async function dailyReview() {
   log('Daily review complete.');
 }
 
-function buildDailyPrompt(newIdeas, allIdeas, todoMd, statusMd) {
-  const ideasJson = JSON.stringify(newIdeas, null, 2);
+function buildDailyPrompt(newIdeas, allIdeas, ctx) {
+  const { todoMd, statusMd, projectTodos, projectStatuses } = ctx;
+  // Normalize project field on ideas sent to the model in multi-project mode
+  const normalizedIdeas = MULTI_PROJECT
+    ? newIdeas.map(i => ({ ...i, project: projectOf(i) }))
+    : newIdeas;
+  const ideasJson = JSON.stringify(normalizedIdeas, null, 2);
 
-  let prompt = `You are the daily review analyst for "${PROJECT_NAME}".
+  let prompt;
+  if (MULTI_PROJECT) {
+    prompt = `You are the daily review analyst for multiple projects: ${PROJECTS.join(', ')}.
+Each idea has a "project" field. When checking for duplicates, check only against the TODO file of the matching project.
+
+## ROI Scoring (1-5 scale for each, then weighted composite out of 10)
+- Security Impact (weight: ${WEIGHTS.security}): Does this improve security posture, protect users, or address vulnerabilities?
+- Customer Value (weight: ${WEIGHTS.customer}): Does this directly benefit users? Improve UX? Solve pain points?
+- Implementation Effort (weight: ${WEIGHTS.effort}): How easy to implement? 5=trivial (hours), 4=small (1 day), 3=medium (2-3 days), 2=large (1 week), 1=massive (weeks+)
+- Business Impact (weight: ${WEIGHTS.business}): Revenue potential, differentiation, growth, competitive advantage?
+
+Composite = (security*${WEIGHTS.security} + customer*${WEIGHTS.customer} + effort*${WEIGHTS.effort} + business*${WEIGHTS.business}) * 2
+
+## New Ideas to Review
+${ideasJson}
+`;
+    for (const p of PROJECTS) {
+      prompt += `\n## ${p} Backlog (TODO)\n${projectTodos[p] || '(none)'}\n`;
+      if (projectStatuses[p]) {
+        prompt += `\n## ${p} Feature Inventory (STATUS)\n${projectStatuses[p]}\n`;
+      }
+    }
+  } else {
+    prompt = `You are the daily review analyst for "${PROJECT_NAME}".
 Your job is to analyze new ideas, score them by ROI, check for duplicates against the existing backlog${statusMd ? ' AND already-shipped features' : ''}, and make recommendations.
 
 ## ROI Scoring (1-5 scale for each, then weighted composite out of 10)
@@ -245,12 +328,12 @@ ${ideasJson}
 
 ## Current Backlog (TODO) - Check for duplicates against planned work
 ${todoMd}`;
-
-  if (statusMd) {
-    prompt += `
+    if (statusMd) {
+      prompt += `
 
 ## Current Feature Inventory (STATUS) - Check for duplicates against shipped features
 ${statusMd}`;
+    }
   }
 
   prompt += `
@@ -261,7 +344,7 @@ For each new idea, provide:
 - Whether it duplicates an existing backlog item or shipped feature (cite which one)
 - Brief research notes: best practices, competitor approaches, security implications
 - Recommendation: "add_to_todo" (should be added to backlog), "defer" (interesting but not now), "reject" (not valuable), "needs_research" (promising but needs deeper investigation)
-- If "add_to_todo": suggest which backlog section and priority (P0-P3)
+- If "add_to_todo": suggest which backlog section and priority (P0-P3)${MULTI_PROJECT ? '\n- Echo the idea\'s project in your output so the report can group by project' : ''}
 
 CRITICAL JSON RULES:
 - Respond with ONLY the raw JSON object. No markdown fences, no text before or after.
@@ -271,7 +354,7 @@ CRITICAL JSON RULES:
   "ideas": [
     {
       "id": <number>,
-      "title": "<string>",
+      "title": "<string>",${MULTI_PROJECT ? `\n      "project": "${PROJECTS.join('|')}",` : ''}
       "scores": { "security": <1-5>, "customer": <1-5>, "effort": <1-5>, "business": <1-5> },
       "roi_composite": <number 0-10>,
       "is_duplicate": <boolean>,
@@ -290,60 +373,87 @@ CRITICAL JSON RULES:
   return prompt;
 }
 
+function renderIdeaBlock(idea) {
+  const rec = {
+    add_to_todo: 'ADD TO BACKLOG',
+    defer: 'DEFER',
+    reject: 'REJECT',
+    needs_research: 'NEEDS RESEARCH',
+  }[idea.recommendation] || idea.recommendation;
+  let md = '';
+  md += `${MULTI_PROJECT ? '### ' : '## '}#${idea.id} - ${idea.title}\n\n`;
+  md += `| Metric | Score |\n|--------|-------|\n`;
+  md += `| Security | ${idea.scores?.security || '?'}/5 |\n`;
+  md += `| Customer | ${idea.scores?.customer || '?'}/5 |\n`;
+  md += `| Effort | ${idea.scores?.effort || '?'}/5 |\n`;
+  md += `| Business | ${idea.scores?.business || '?'}/5 |\n`;
+  md += `| **ROI Composite** | **${idea.roi_composite || '?'}/10** |\n\n`;
+  md += `**Recommendation:** ${rec}`;
+  if (idea.suggested_priority) md += ` (${idea.suggested_priority})`;
+  if (idea.suggested_section) md += ` - Section: ${idea.suggested_section}`;
+  md += `\n\n`;
+  if (idea.is_duplicate) md += `**Duplicate of:** ${idea.duplicate_of}\n\n`;
+  if (idea.research_notes) md += `**Research:** ${idea.research_notes}\n\n`;
+  if (idea.rationale) md += `**Rationale:** ${idea.rationale}\n\n`;
+  md += `---\n\n`;
+  return md;
+}
+
 function buildDailyReport(result, newIdeas) {
   let md = `# Daily Ideas Review - ${today()}\n\n`;
-  md += `**Project:** ${PROJECT_NAME}\n`;
+  md += `**Project:** ${MULTI_PROJECT ? PROJECTS.join(', ') : PROJECT_NAME}\n`;
   md += `**Ideas reviewed:** ${(result.ideas || []).length}\n\n`;
 
-  for (const idea of result.ideas || []) {
-    const rec = {
-      add_to_todo: 'ADD TO BACKLOG',
-      defer: 'DEFER',
-      reject: 'REJECT',
-      needs_research: 'NEEDS RESEARCH',
-    }[idea.recommendation] || idea.recommendation;
-
-    md += `## #${idea.id} - ${idea.title}\n\n`;
-    md += `| Metric | Score |\n|--------|-------|\n`;
-    md += `| Security | ${idea.scores?.security || '?'}/5 |\n`;
-    md += `| Customer | ${idea.scores?.customer || '?'}/5 |\n`;
-    md += `| Effort | ${idea.scores?.effort || '?'}/5 |\n`;
-    md += `| Business | ${idea.scores?.business || '?'}/5 |\n`;
-    md += `| **ROI Composite** | **${idea.roi_composite || '?'}/10** |\n\n`;
-    md += `**Recommendation:** ${rec}`;
-    if (idea.suggested_priority) md += ` (${idea.suggested_priority})`;
-    if (idea.suggested_section) md += ` - Section: ${idea.suggested_section}`;
-    md += `\n\n`;
-    if (idea.is_duplicate) md += `**Duplicate of:** ${idea.duplicate_of}\n\n`;
-    if (idea.research_notes) md += `**Research:** ${idea.research_notes}\n\n`;
-    if (idea.rationale) md += `**Rationale:** ${idea.rationale}\n\n`;
-    md += `---\n\n`;
+  if (MULTI_PROJECT) {
+    const byProject = Object.fromEntries(PROJECTS.map(p => [p, []]));
+    for (const idea of result.ideas || []) {
+      const p = PROJECTS.includes(idea.project) ? idea.project : DEFAULT_PROJECT;
+      (byProject[p] || byProject[DEFAULT_PROJECT]).push(idea);
+    }
+    for (const p of PROJECTS) {
+      if (!byProject[p].length) continue;
+      md += `## ${p} (${byProject[p].length})\n\n`;
+      for (const idea of byProject[p]) md += renderIdeaBlock(idea);
+    }
+  } else {
+    for (const idea of result.ideas || []) md += renderIdeaBlock(idea);
   }
 
-  if (result.ranked_summary) {
-    md += `## Ranked Summary\n\n${result.ranked_summary}\n\n`;
-  }
-  if (result.top_recommendation) {
-    md += `## Top Recommendation\n\n${result.top_recommendation}\n\n`;
-  }
-
+  if (result.ranked_summary) md += `## Ranked Summary\n\n${result.ranked_summary}\n\n`;
+  if (result.top_recommendation) md += `## Top Recommendation\n\n${result.top_recommendation}\n\n`;
   return md;
+}
+
+function ideaTelegramLine(idea) {
+  const emoji = {
+    add_to_todo: '\u2705',
+    defer: '\u23f8\ufe0f',
+    reject: '\u274c',
+    needs_research: '\ud83d\udd0d',
+  }[idea.recommendation] || '\u2753';
+  return `${emoji} #${idea.id} <b>${idea.title}</b> [${idea.roi_composite}/10]\n`;
 }
 
 function buildDailyTelegram(result) {
   let msg = `\u2615 <b>Daily Ideas Review</b> (${today()})\n\n`;
-  for (const idea of result.ideas || []) {
-    const emoji = {
-      add_to_todo: '\u2705',
-      defer: '\u23f8\ufe0f',
-      reject: '\u274c',
-      needs_research: '\ud83d\udd0d',
-    }[idea.recommendation] || '\u2753';
-    msg += `${emoji} #${idea.id} <b>${idea.title}</b> [${idea.roi_composite}/10]\n`;
+
+  if (MULTI_PROJECT) {
+    const byProject = Object.fromEntries(PROJECTS.map(p => [p, []]));
+    for (const idea of result.ideas || []) {
+      const p = PROJECTS.includes(idea.project) ? idea.project : DEFAULT_PROJECT;
+      (byProject[p] || byProject[DEFAULT_PROJECT]).push(idea);
+    }
+    for (const p of PROJECTS) {
+      if (!byProject[p].length) continue;
+      msg += `<b>[${p}]</b>\n`;
+      for (const idea of byProject[p]) msg += ideaTelegramLine(idea);
+      msg += `\n`;
+    }
+  } else {
+    for (const idea of result.ideas || []) msg += ideaTelegramLine(idea);
   }
-  if (result.top_recommendation) {
-    msg += `\n\ud83c\udfaf <b>Focus:</b> ${result.top_recommendation}`;
-  }
+
+  if (result.top_recommendation) msg += `\n\ud83c\udfaf <b>Focus:</b> ${result.top_recommendation}`;
   return msg;
 }
 
@@ -353,9 +463,11 @@ async function weeklyReport() {
   log('Starting weekly progress report...');
 
   const ideas = await fetchIdeas();
-  const todoMd = readTodo();
-  const statusMd = readStatus();
-  const prompt = buildWeeklyPrompt(ideas, todoMd, statusMd);
+  const todoMd = MULTI_PROJECT ? null : readTodo();
+  const statusMd = MULTI_PROJECT ? null : readStatus();
+  const projectTodos = readProjectTodos();
+  const projectStatuses = readProjectStatuses();
+  const prompt = buildWeeklyPrompt(ideas, { todoMd, statusMd, projectTodos, projectStatuses });
   const analysis = await callNicodaimus(prompt);
 
   let result;
@@ -377,8 +489,24 @@ async function weeklyReport() {
   log('Weekly report complete.');
 }
 
-function buildWeeklyPrompt(ideas, todoMd, statusMd) {
-  let prompt = `You are the weekly review analyst for "${PROJECT_NAME}".
+function buildWeeklyPrompt(ideas, ctx) {
+  const { todoMd, statusMd, projectTodos, projectStatuses } = ctx;
+  const normalizedIdeas = MULTI_PROJECT ? ideas.map(i => ({ ...i, project: projectOf(i) })) : ideas;
+
+  let prompt;
+  if (MULTI_PROJECT) {
+    prompt = `You are the weekly review analyst for multiple projects: ${PROJECTS.join(', ')}.
+Produce a Sunday evening progress report: what happened this week per project, what has been implemented, parked, or deferred, and what should come next.
+
+## All Ideas in Pipeline
+${JSON.stringify(normalizedIdeas, null, 2)}
+`;
+    for (const p of PROJECTS) {
+      prompt += `\n## ${p} Backlog (TODO)\n${projectTodos[p] || '(none)'}\n`;
+      if (projectStatuses[p]) prompt += `\n## ${p} Feature Inventory\n${projectStatuses[p]}\n`;
+    }
+  } else {
+    prompt = `You are the weekly review analyst for "${PROJECT_NAME}".
 Your job is to produce a Sunday evening progress report: what happened this week, what's been implemented, parked, or deferred, and what should come next.
 
 ## All Ideas in Pipeline
@@ -386,12 +514,12 @@ ${JSON.stringify(ideas, null, 2)}
 
 ## Current Backlog (TODO)
 ${todoMd}`;
-
-  if (statusMd) {
-    prompt += `
+    if (statusMd) {
+      prompt += `
 
 ## Current Feature Inventory (STATUS) - What's already shipped
 ${statusMd}`;
+    }
   }
 
   prompt += `
@@ -400,15 +528,35 @@ ${statusMd}`;
 Security: ${WEIGHTS.security}, Customer: ${WEIGHTS.customer}, Effort: ${WEIGHTS.effort}, Business: ${WEIGHTS.business}
 
 ## Instructions
-1. Categorize all ideas by current status (new, reviewed, done, rejected, deferred)
+1. Categorize all ideas by current status (new, reviewed, done, rejected, deferred)${MULTI_PROJECT ? ' AND by project' : ''}
 2. For ideas still "new" or "reviewed": re-evaluate priorities. Has anything changed? Should priorities shift?
-3. Check for duplicates across ideas AND between ideas and the backlog
-4. Identify the top 3-5 items to focus on next week (from both ideas and backlog), ranked by ROI
+3. Check for duplicates across ideas AND between ideas and the backlog${MULTI_PROJECT ? ' of the matching project' : ''}
+4. Identify the top 3-5 items to focus on next week${MULTI_PROJECT ? ' per project' : ''} (from both ideas and backlog), ranked by ROI
 5. Flag any ideas that have been sitting too long without action (>7 days in "new")
-6. Provide a weekly health score (1-10): is the idea pipeline flowing well? Are items getting actioned?
+6. Provide a weekly health score (1-10)${MULTI_PROJECT ? ' per project' : ''}: is the idea pipeline flowing well? Are items getting actioned?
 
 Respond with ONLY valid JSON:
-{
+`;
+  if (MULTI_PROJECT) {
+    prompt += `{
+  "status_summary": {
+    "total": <number>, "new": <number>, "reviewed": <number>, "done": <number>, "rejected": <number>, "deferred": <number>,
+    "by_project": { ${PROJECTS.map(p => `"${p}": <number>`).join(', ')} }
+  },
+  "projects": {
+${PROJECTS.map(p => `    "${p}": {
+      "completed_this_week": ["<title>", ...],
+      "priority_changes": [ { "id": <number>, "title": "<string>", "old_priority": "<string>", "new_priority": "<string>", "reason": "<string>" } ],
+      "duplicates_found": [ { "idea_id": <number>, "duplicate_of": "<string>" } ],
+      "stale_ideas": [ { "id": <number>, "title": "<string>", "days_old": <number> } ],
+      "next_week_focus": [ { "title": "<string>", "source": "idea|todo", "roi_score": <number>, "rationale": "<string>" } ],
+      "pipeline_health": <1-10>,
+      "pipeline_health_notes": "<string>"
+    }`).join(',\n')}
+  }
+}`;
+  } else {
+    prompt += `{
   "status_summary": {
     "total": <number>,
     "new": <number>,
@@ -433,107 +581,149 @@ Respond with ONLY valid JSON:
   "pipeline_health": <1-10>,
   "pipeline_health_notes": "<string>"
 }`;
+  }
 
   return prompt;
 }
 
+function renderWeeklyProjectSectionMd(data, label) {
+  let md = '';
+  md += `## ${label}\n\n`;
+  if (data.pipeline_health) md += `**Pipeline Health:** ${data.pipeline_health}/10\n`;
+  if (data.pipeline_health_notes) md += `${data.pipeline_health_notes}\n`;
+  md += `\n`;
+
+  if (data.completed_this_week?.length) {
+    md += `### Completed This Week\n`;
+    for (const item of data.completed_this_week) md += `- ${item}\n`;
+    md += `\n`;
+  }
+  if (data.priority_changes?.length) {
+    md += `### Priority Changes\n`;
+    for (const pc of data.priority_changes) md += `- #${pc.id} ${pc.title}: ${pc.old_priority} -> ${pc.new_priority} (${pc.reason})\n`;
+    md += `\n`;
+  }
+  if (data.duplicates_found?.length) {
+    md += `### Duplicates Found\n`;
+    for (const d of data.duplicates_found) md += `- Idea #${d.idea_id} duplicates: ${d.duplicate_of}\n`;
+    md += `\n`;
+  }
+  if (data.stale_ideas?.length) {
+    md += `### Stale Ideas (>7 days)\n`;
+    for (const si of data.stale_ideas) md += `- #${si.id} ${si.title} (${si.days_old} days old)\n`;
+    md += `\n`;
+  }
+  if (data.next_week_focus?.length) {
+    md += `### Next Week Focus\n`;
+    for (let i = 0; i < data.next_week_focus.length; i++) {
+      const f = data.next_week_focus[i];
+      md += `${i + 1}. **${f.title}** (ROI: ${f.roi_score}/10) - Source: ${f.source || 'unknown'}\n`;
+      if (f.rationale) md += `   ${f.rationale}\n`;
+    }
+    md += `\n`;
+  }
+  return md;
+}
+
 function buildWeeklyReport(result) {
-  let md = `# Weekly Progress Report - ${today()}\n\n**Project:** ${PROJECT_NAME}\n\n`;
+  let md = `# Weekly Progress Report - ${today()}\n\n`;
+  md += `**Project:** ${MULTI_PROJECT ? PROJECTS.join(', ') : PROJECT_NAME}\n\n`;
 
   const s = result.status_summary || {};
   md += `## Pipeline Status\n`;
   md += `| Status | Count |\n|--------|-------|\n`;
-  for (const [k, v] of Object.entries(s)) md += `| ${k} | ${v} |\n`;
-  md += `\n**Pipeline Health:** ${result.pipeline_health || '?'}/10\n`;
-  if (result.pipeline_health_notes) md += `${result.pipeline_health_notes}\n`;
+  for (const [k, v] of Object.entries(s)) {
+    if (k === 'by_project') continue;
+    md += `| ${k} | ${v} |\n`;
+  }
+  if (MULTI_PROJECT && s.by_project) {
+    md += `\n**By project:** `;
+    md += PROJECTS.filter(p => s.by_project[p]).map(p => `[${p}]: ${s.by_project[p]}`).join(' | ');
+    md += `\n`;
+  }
   md += `\n`;
 
-  if (result.completed_this_week?.length) {
-    md += `## Completed This Week\n`;
-    for (const item of result.completed_this_week) md += `- ${item}\n`;
-    md += `\n`;
-  }
-
-  if (result.priority_changes?.length) {
-    md += `## Priority Changes\n`;
-    for (const pc of result.priority_changes) {
-      md += `- #${pc.id} ${pc.title}: ${pc.old_priority} -> ${pc.new_priority} (${pc.reason})\n`;
+  if (MULTI_PROJECT) {
+    const projects = result.projects || {};
+    for (const p of PROJECTS) {
+      const data = projects[p];
+      if (!data) continue;
+      md += renderWeeklyProjectSectionMd(data, p);
     }
-    md += `\n`;
-  }
-
-  if (result.duplicates_found?.length) {
-    md += `## Duplicates Found\n`;
-    for (const d of result.duplicates_found) {
-      md += `- Idea #${d.idea_id} duplicates: ${d.duplicate_of}\n`;
-    }
-    md += `\n`;
-  }
-
-  if (result.stale_ideas?.length) {
-    md += `## Stale Ideas (>7 days)\n`;
-    for (const si of result.stale_ideas) {
-      md += `- #${si.id} ${si.title} (${si.days_old} days old)\n`;
-    }
-    md += `\n`;
-  }
-
-  if (result.next_week_focus?.length) {
-    md += `## Next Week Focus\n`;
-    for (let i = 0; i < result.next_week_focus.length; i++) {
-      const f = result.next_week_focus[i];
-      md += `### ${i + 1}. ${f.title} (ROI: ${f.roi_score}/10)\n`;
-      md += `Source: ${f.source || 'unknown'} | ${f.rationale}\n\n`;
-    }
+  } else {
+    md += renderWeeklyProjectSectionMd({
+      pipeline_health: result.pipeline_health,
+      pipeline_health_notes: result.pipeline_health_notes,
+      completed_this_week: result.completed_this_week,
+      priority_changes: result.priority_changes,
+      duplicates_found: result.duplicates_found,
+      stale_ideas: result.stale_ideas,
+      next_week_focus: result.next_week_focus,
+    }, PROJECT_NAME);
   }
 
   return md;
 }
 
+function renderWeeklyProjectSectionTg(data, label) {
+  let msg = `<b>[${label}]</b>`;
+  if (data.pipeline_health) msg += ` - Health ${data.pipeline_health}/10`;
+  msg += `\n`;
+
+  if (data.completed_this_week?.length) {
+    msg += `\u2705 Shipped:\n`;
+    for (const item of data.completed_this_week.slice(0, 3)) msg += `  ${item}\n`;
+    if (data.completed_this_week.length > 3) msg += `  +${data.completed_this_week.length - 3} more\n`;
+  }
+  if (data.next_week_focus?.length) {
+    msg += `\ud83c\udfaf Next:\n`;
+    for (let i = 0; i < Math.min(data.next_week_focus.length, 3); i++) {
+      const f = data.next_week_focus[i];
+      msg += `  ${i + 1}. <b>${f.title}</b> [${f.roi_score}/10]\n`;
+    }
+  }
+  if (data.stale_ideas?.length) {
+    msg += `\u26a0\ufe0f ${data.stale_ideas.length} stale: `;
+    msg += data.stale_ideas.map(si => `#${si.id}`).join(', ');
+    msg += `\n`;
+  }
+  if (data.duplicates_found?.length) {
+    msg += `\ud83d\udd04 ${data.duplicates_found.length} duplicate(s)\n`;
+  }
+  msg += `\n`;
+  return msg;
+}
+
 function buildWeeklyTelegram(result) {
   const s = result.status_summary || {};
   let msg = `\ud83d\udcca <b>Weekly Report</b> (${today()})\n`;
-  msg += `Health: ${result.pipeline_health || '?'}/10 | ${s.total || '?'} ideas\n\n`;
+  msg += `Total ideas: ${s.total || '?'}`;
+  if (MULTI_PROJECT && s.by_project) {
+    const parts = PROJECTS.filter(p => s.by_project[p]).map(p => `[${p}] ${s.by_project[p]}`);
+    if (parts.length) msg += ` | ${parts.join(' ')}`;
+  }
+  msg += `\n\n`;
 
-  if (result.completed_this_week?.length) {
-    msg += `\u2705 <b>Shipped:</b>\n`;
-    for (const item of result.completed_this_week.slice(0, 5)) {
-      msg += `  ${item}\n`;
+  if (MULTI_PROJECT) {
+    const projects = result.projects || {};
+    for (const p of PROJECTS) {
+      const data = projects[p];
+      if (!data) continue;
+      msg += renderWeeklyProjectSectionTg(data, p);
     }
-    if (result.completed_this_week.length > 5) {
-      msg += `  +${result.completed_this_week.length - 5} more\n`;
+  } else {
+    msg += renderWeeklyProjectSectionTg({
+      pipeline_health: result.pipeline_health,
+      completed_this_week: result.completed_this_week,
+      next_week_focus: result.next_week_focus,
+      stale_ideas: result.stale_ideas,
+      duplicates_found: result.duplicates_found,
+    }, PROJECT_NAME);
+    if (result.pipeline_health_notes) {
+      const first = result.pipeline_health_notes.split('. ')[0];
+      const note = first.endsWith('.') ? first : first + '.';
+      msg += `<i>${note}</i>`;
     }
-    msg += `\n`;
-  }
-
-  if (result.next_week_focus?.length) {
-    msg += `\ud83c\udfaf <b>Next week:</b>\n`;
-    for (let i = 0; i < Math.min(result.next_week_focus.length, 3); i++) {
-      const f = result.next_week_focus[i];
-      msg += `  ${i + 1}. <b>${f.title}</b> [${f.roi_score}/10]\n`;
-      if (f.rationale) {
-        const first = f.rationale.split('. ')[0];
-        const short = first.endsWith('.') ? first : first + '.';
-        msg += `     <i>${short}</i>\n`;
-      }
-    }
-    msg += `\n`;
-  }
-
-  if (result.stale_ideas?.length) {
-    msg += `\u26a0\ufe0f <b>${result.stale_ideas.length} stale:</b> `;
-    msg += result.stale_ideas.map(si => `#${si.id}`).join(', ');
-    msg += `\n\n`;
-  }
-
-  if (result.duplicates_found?.length) {
-    msg += `\ud83d\udd04 <b>${result.duplicates_found.length} duplicate(s)</b> found\n\n`;
-  }
-
-  if (result.pipeline_health_notes) {
-    const first = result.pipeline_health_notes.split('. ')[0];
-    const note = first.endsWith('.') ? first : first + '.';
-    msg += `<i>${note}</i>`;
   }
 
   return msg;
